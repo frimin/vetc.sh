@@ -1,0 +1,558 @@
+#!/usr/bin/env bash
+
+IFSTAT_RESET=0
+INETEM_OPTS=()
+IRATE_OPTS=()
+ONETEM_OPTS=()
+ORATE_OPTS=()
+TCP_PORTS=()
+UDP_PORTS=()
+
+# Import vars
+NAME="${VETC_NAME:-vetc}"
+VETH_ADDR="${VETC_VETH_ADDR:-10.9.2.1}"
+VPEER_ADDR="${VETC_VPEER_ADDR:-10.9.2.2}"
+ADDR_MASK=$"${VETC_ADDR_MASK:-24}"
+VERBOSE="${VETC_VERBOSE:-0}"
+FW_MODE="${VETC_FW_MODE:-}"
+
+# Global vars
+NAME="${NAME,,}"
+NS="ns-${NAME,,}"
+ZONENAME="${NAME,,}"
+CHAIN_NAME="${NAME^^}"
+VETH="veth-${NAME,,}"
+VPEER="vpeer-${NAME,,}"
+IPTABLES_OPTS=(-w 5)
+
+if [[ -t 1 ]]; then
+    COLOR_GREEN='\033[0;32m'
+    COLOR_YELLOW='\033[0;33m'
+    NC='\033[0m'
+else
+    unset COLOR_GREEN
+    unset COLOR_YELLOW
+    unset NC
+fi
+
+# Local functions
+
+help () {
+    echo "Usage: $(basename $0) [ VERBOSE ] [ u|up ]
+       $(basename $0) [ VERBOSE ] get GETOPT
+       $(basename $0) [ VERBOSE ] [ d|down ]
+       $(basename $0) [ VERBOSE ] [ NETCONFIG ... ] exec [ ARG... ]
+       $(basename $0) [ VERBOSE ] [ NETCONFIG ... ] bash
+
+where GETOPT := { veth | veth_addr | vpeer | vpeer_addr  } 
+      VERBOSE := { v[erbose] } 
+      NETCONFIG := { PORT_FORWARD | TRAFFIC_CONTROL }
+      PORT_FORWARD := { [PORT]/tcp | [PORT]/udp }
+      TRAFFIC_CONTROL := { [i|o]delay TIME [CORRELATION] |
+                           [i|o]loss PERCENT [CORRELATION] |
+                           [i|o]duplicate PERCENT [CORRELATION] |
+                           [i|o]reorder PERCENT [CORRELATION] |
+                           [i|o]rate RATE }
+
+example:
+     bash $(basename $0) delay 50ms 5ms loss 5% 1% exec ping www.google.com
+     bash $(basename $0) 8081/tcp orate 800kbit exec python3 -m http.server 8081
+
+Get more TRAFFIC_CONTROL options, see tc-netem(8), tc-tbf(8)
+"
+}
+
+msg () { [[ $VERBOSE -eq 1 ]] && echo "$@"; }  
+
+error () { echo "$1" >&2; exit 255; }
+
+get_opt () {
+    if [[ $1 == 'veth' ]]; then
+        echo $VETH
+    elif [[ $1 == 'veth_addr' ]]; then
+        echo $VETH_ADDR
+    elif [[ $1 == 'vpeer' ]]; then
+        echo $VPEER
+    elif [[ $1 == 'vpeer_addr' ]]; then
+        echo $VPEER_ADDR
+    else
+        error "unknown option: $1"
+    fi
+}
+
+# protect execute, abort on error
+pe () {
+    [[ $VERBOSE -eq 1 ]] && echo '> '"$@" 
+
+    local cmd=$1; shift
+
+    if [[ $VERBOSE -eq 1 ]]; then
+        $cmd $@
+    else
+        $cmd $@ >/dev/null 2>/dev/null
+    fi
+
+    local ret=$?
+    if [[ $ret -eq 0 ]]; then
+        :
+    else
+        if [[ $VERBOSE -ne 1 ]]; then
+            echo "Abort, use for more information : bash $(basename $0) verbose [options ... ]"
+        else
+            echo "Abort"
+        fi
+        exit 255
+    fi
+
+    return 0
+}
+
+# try execute, skip on error
+te () {
+    [[ $VERBOSE -eq 1 ]] && echo '> '"$@" 
+    local cmd=$1; shift
+
+    if [[ $VERBOSE -eq 1 ]]; then
+        $cmd $@
+    else
+        $cmd $@ >/dev/null 2>/dev/null
+    fi
+
+    local ret=$?
+
+    if [[ $ret -eq 0 ]]; then
+       :
+    else
+       [[ $VERBOSE -eq 1 ]] && echo -e "Skip"
+    fi
+    return 0
+}
+
+is_nft () {
+    [[ -z "$(which iptables)" ]] && return 0 # Use nfttables
+    [[ -z "$(which nft)" ]] && return 1 # Use iptables
+    # Any iptables rule-defining
+    [[ -z "$(iptables-save)" ]] && return 0 # Use nfttables
+    # Any nft rule-defining
+    [[ -z "$(nft list tables)" && -z "$(nft list ruleset)" ]] && return 1 # Use iptables
+    error "check nft failed"
+}
+
+check_firewall_type () {
+    [[ -n $FW_MODE ]] && return 0
+
+    if which firewall-cmd > /dev/null && systemctl is-active firewalld.service > /dev/null; then
+        FW_MODE='firewalld'
+        return 0
+    fi
+
+    if is_nft; then
+        FW_MODE='nftables'
+        return 0
+    else
+        FW_MODE='iptables'
+        return 0
+    fi
+
+    error "No firewall installed"
+}
+
+netns_exists () {
+    ip netns pids ${NS} > /dev/null 2>/dev/null; 
+}
+
+setup_interface () {
+    if ! netns_exists; then
+        # Create namespace
+        pe ip netns add ${NS}
+    else
+        error "Network namespace exists: ${NS}"
+    fi
+
+    if ! ip link show dev ${VETH} > /dev/null 2>/dev/null; then
+        # Create veth link
+        pe ip link add dev ${VETH} type veth peer name ${VPEER}
+
+        # Add peer to NS
+        pe ip link set ${VPEER} netns ${NS}
+
+        # Setup IP address of ${VETH}
+        pe ip addr add ${VETH_ADDR}/24 dev ${VETH}
+        pe ip link set ${VETH} up
+
+        # Setup IP ${VPEER} network
+        pe ip netns exec $NS ip addr add ${VPEER_ADDR}/${ADDR_MASK} dev ${VPEER}
+        pe ip netns exec $NS ip link set ${VPEER} up
+        pe ip netns exec $NS ip link set lo up
+        pe ip netns exec $NS ip route add default via ${VETH_ADDR}
+    else
+        error "Network device exists: ${VETH}"
+    fi
+}
+
+cleanup_interface () {
+    if netns_exists; then
+        te ip netns del ${NS}
+
+        if netns_exists; then
+            echo -e "$COLOR_YELLOW[Warning]$NC Network namespace '$NS' cleanup failed" >&2
+            return 1
+        fi
+        return 0
+    fi
+    return 1
+}
+
+cleanup_forward () {
+    if [[ $FW_MODE == 'firewalld' ]]; then
+        for forward in $(firewall-cmd --list-forward-ports); do
+            # Remove all forward to vpeer rule
+            if [[ $forward == *"toaddr=$VPEER_ADDR"* ]]; then
+                pe firewall-cmd --permanent --remove-forward-port="$forward"
+            fi
+        done
+    elif [[ $FW_MODE == 'iptables' ]]; then
+        if iptables --table nat -n --list $CHAIN_NAME > /dev/null 2>/dev/null; then
+            pe iptables -t nat -F $CHAIN_NAME "${IPTABLES_OPTS[@]}"
+        fi
+    elif [[ $FW_MODE == 'nftables' ]]; then
+        if nft list table ip $NAME > /dev/null 2>/dev/null; then
+            pe nft "flush chain ip $NAME nat_PREROUTING_forward"
+        fi
+    fi
+
+    return 0
+}
+
+setup_forward () {
+    local LFS=' '; 
+
+    cleanup_forward
+
+    for port in "${TCP_PORTS[@]}"; do 
+        if [[ $FW_MODE == 'firewalld' ]]; then
+            pe firewall-cmd --permanent --add-forward-port=port=$port:proto=tcp:toaddr=$VPEER_ADDR
+        elif [[ $FW_MODE == 'iptables' ]]; then
+            pe iptables -t nat -A $CHAIN_NAME ! -i $VETH -p tcp -m tcp --dport $port -j DNAT --to-destination $VPEER_ADDR:$port "${IPTABLES_OPTS[@]}"
+        elif [[ $FW_MODE == 'nftables' ]]; then
+            pe nft "add rule ip $NAME nat_PREROUTING_forward iifname != \"$VETH\" tcp dport $port counter dnat to $VPEER_ADDR:$port"
+        fi
+    done 
+
+    for port in "${UDP_PORTS[@]}"; do 
+        if [[ $FW_MODE == 'firewalld' ]]; then
+            pe firewall-cmd --permanent --add-forward-port=port=$port:proto=udp:toaddr=$VPEER_ADDR
+        elif [[ $FW_MODE == 'iptables' ]]; then
+            pe iptables -t nat -A $CHAIN_NAME ! -i $VETH -p udp -m udp --dport $port -j DNAT --to-destination $VPEER_ADDR:$port "${IPTABLES_OPTS[@]}"
+        elif [[ $FW_MODE == 'nftables' ]]; then
+            pe nft "add rule ip $NAME nat_PREROUTING_forward iifname != \"$VETH\" udp dport $port counter dnat to $VPEER_ADDR:$port"
+        fi
+    done 
+
+    if [[ $FW_MODE == 'firewalld' ]]; then
+        pe firewall-cmd --reload
+    fi
+
+    return 0
+}
+
+setup_firewall () {
+    if [[ $FW_MODE == 'firewalld' ]]; then
+        if ! firewall-cmd --query-masquerade > /dev/null 2>/dev/null; then
+            pe firewall-cmd --permanent --add-masquerade
+        fi
+        pe firewall-cmd --permanent --new-zone=$ZONENAME
+        pe firewall-cmd --permanent --add-masquerade --zone $ZONENAME
+        pe firewall-cmd --permanent --set-target=ACCEPT --zone $ZONENAME
+        pe firewall-cmd --reload 
+        pe firewall-cmd --permanent --change-interface $VETH --zone $ZONENAME
+        pe firewall-cmd --reload
+    elif [[ $FW_MODE == 'iptables' ]]; then
+        pe iptables -t nat -N $CHAIN_NAME "${IPTABLES_OPTS[@]}"
+        pe iptables -t nat -A PREROUTING -j $CHAIN_NAME "${IPTABLES_OPTS[@]}"
+        pe iptables -t nat -I POSTROUTING -s $VETH_ADDR/$ADDR_MASK ! -o $VETH -j MASQUERADE "${IPTABLES_OPTS[@]}"
+    elif [[ $FW_MODE == 'nftables' ]]; then
+        pe nft "add table ip $NAME"
+        pe nft "add chain ip $NAME nat_PREROUTING_forward"
+        pe nft "add chain ip $NAME nat_PREROUTING { type nat hook prerouting priority 0; policy accept; }"
+        pe nft "add chain ip $NAME nat_POSTROUTING { type nat hook postrouting priority 300; policy accept; }"
+        pe nft "add rule ip $NAME nat_POSTROUTING oifname != \"$VETH\" ip saddr $VETH_ADDR/$ADDR_MASK counter masquerade"
+        pe nft "add rule ip $NAME nat_PREROUTING counter jump nat_PREROUTING_forward"
+    fi
+
+    if [[ $(< /proc/sys/net/ipv4/ip_forward) -ne 1 ]]; then
+        echo -e "$COLOR_YELLOW[Warning]$NC Require IPv4 forward, try command: echo 1 > /proc/sys/net/ipv4/ip_forward" >&2
+    fi
+}
+
+cleanup_firewall() {
+    cleanup_forward
+
+    if [[ $FW_MODE = 'firewalld' ]]; then
+        if firewall-cmd --list-all --zone $ZONENAME > /dev/null 2>/dev/null; then
+            te firewall-cmd --permanent --delete-zone=$ZONENAME
+            te firewall-cmd --reload
+            return 0
+        fi
+    elif [[ $FW_MODE == 'iptables' ]]; then
+        if iptables --table nat -n --list $CHAIN_NAME > /dev/null 2>/dev/null; then
+            te iptables -t nat -D PREROUTING -j $CHAIN_NAME "${IPTABLES_OPTS[@]}"
+            te iptables -t nat -D POSTROUTING -s $VETH_ADDR/$ADDR_MASK ! -o $VETH -j MASQUERADE "${IPTABLES_OPTS[@]}"
+            te iptables -t nat -F $CHAIN_NAME "${IPTABLES_OPTS[@]}" 
+            te iptables -t nat -X $CHAIN_NAME "${IPTABLES_OPTS[@]}"
+            return 0
+        fi
+    elif [[ $FW_MODE == 'nftables' ]]; then
+        if nft list table ip $NAME > /dev/null 2>/dev/null; then
+            te nft "delete table ip $NAME"
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+
+setup_tc() {
+    local QDISC_ID
+    local QDISC_HANDLE
+
+    qdisc_init () {
+        QDISC_ID=1
+        QDISC_HANDLE="root handle $QDISC_ID"
+    }
+
+    qdisc_next() {
+        QDISC_HANDLE="parent $QDISC_ID: handle $((QDISC_ID+1)):"
+        ((QDISC_ID++))
+    }
+    
+    if [[ $(lsmod | grep sch_netem | wc -l) -eq 0 ]]; then
+        echo -e "$COLOR_YELLOW[Warning]$NC Require NETEM kernel module, try add command: modprobe sch_netem" >&2
+    fi
+
+    te tc qdisc del dev $VETH root
+    te ip netns exec $NS tc qdisc del dev $VPEER root
+
+    qdisc_init
+    [[ -n "${INETEM_OPTS[@]}" ]] && pe tc qdisc add dev $VETH $QDISC_HANDLE netem "${INETEM_OPTS[@]}" && qdisc_next
+    [[ -n "${IRATE_OPTS[@]}" ]] && pe tc qdisc add dev $VETH $QDISC_HANDLE tbf burst 5kb latency 50ms "${IRATE_OPTS[@]}"
+
+    qdisc_init
+    [[ -n "${ONETEM_OPTS[@]}" ]] && pe ip netns exec $NS tc qdisc add dev $VPEER $QDISC_HANDLE netem "${ONETEM_OPTS[@]}" && qdisc_next
+    [[ -n "${ORATE_OPTS[@]}" ]] && pe ip netns exec $NS tc qdisc add dev $VPEER $QDISC_HANDLE tbf burst 5kb latency 50ms "${ORATE_OPTS[@]}"
+
+    return 0
+}
+
+cleanup_all() {
+    echo "Cleanup network namespace '$NS'"
+    cleanup_firewall && cleanup_interface # Abort inside
+    return 0
+}
+
+try_create() {
+    if ! netns_exists ; then
+        echo "Create network namespace '$NS', $FW_MODE mode"
+        trap cleanup_all EXIT
+        setup_interface && setup_firewall # Abort inside
+    else
+        [[ -t 1 ]] && echo "Enter network namespace '$NS', $FW_MODE mode"
+    fi
+    return 0
+}
+
+parse_tc_opts () {
+    local args=("$@")
+    local c=${1:0:1}
+
+    if [[ $c == 'i' ]]; then
+        args[0]=${args[0]:1}
+        INETEM_OPTS+=("${args[@]}")
+    elif [[ $c == 'o' ]]; then
+        args[0]=${args[0]:1}
+        ONETEM_OPTS+=("${args[@]}")
+    else
+        INETEM_OPTS+=("${args[@]}")
+        ONETEM_OPTS+=("${args[@]}")
+    fi
+
+    return 0
+}
+
+parse_rate_opts () {
+    local args=("$@")
+    local c=${1:0:1}
+
+    if [[ $c == 'i' ]]; then
+        args[0]=${args[0]:1}
+        IRATE_OPTS=("${args[@]}")
+    elif [[ $c == 'o' ]]; then
+        args[0]=${args[0]:1}
+        ORATE_OPTS=("${args[@]}")
+    else
+        IRATE_OPTS=("${args[@]}")
+        ORATE_OPTS=("${args[@]}")
+    fi
+
+    return 0
+}
+
+parse_port_forward() {
+    local port
+
+    read -r -a port -d '/' <<< $1
+
+    if [[ "$1" == *'/tcp' ]]; then
+        TCP_PORTS+=(${port})
+    else
+        UDP_PORTS+=(${port})
+    fi
+    
+    return 0
+}
+
+reset_if_io_stat () {
+    [[ $IFSTAT_RESET -eq 0 ]] && return 0
+
+    if [[ -n "${INETEM_OPTS[@]}" || -n "${ONETEM_OPTS[@]}" ]]; then
+        echo 'NetEm i':${INETEM_OPTS[@]:-'-'} 'o':${ONETEM_OPTS[@]:-'-'}
+    fi
+
+    if [[ -n "${IRATE_OPTS[@]}" || -n "${ORATE_OPTS[@]}" ]]; then
+        echo 'Limit i':${IRATE_OPTS[@]:-'-'} 'o':${ORATE_OPTS[@]:-'-'}
+    fi
+
+    if [[ -n "${TCP_PORTS[@]}" || -n ${UDP_PORTS[@]} ]]; then
+        echo 'Forward tcp':${TCP_PORTS[@]:-'-'} 'udp':${UDP_PORTS[@]:-'-'}
+    fi
+
+    setup_forward
+    setup_tc
+}
+
+handle_exec_or_bash () {
+    if [[ $1 == 'bash' ]]; then
+        if ! try_create ; then
+            cleanup_all
+            exit 255
+        fi
+        reset_if_io_stat
+        ip netns exec ${NS} /bin/bash --rcfile <(echo "PS1=\"[\\u@\\h$COLOR_GREEN::$NAME$NC \\W ]\\$> \"")
+        return $?
+    elif [[ $1 == 'exec' ]]; then
+        if ! netns_exists; then
+            error "Network namespace not exists: ${NS}"
+        fi
+
+        reset_if_io_stat
+        shift
+        exec ip netns exec ${NS} "$@"
+        return $?
+    fi
+
+    return 255
+}
+
+handle_cmd_args () {
+    local tc_opts=()
+    local i=0
+    local args=("$@")
+    local arg
+
+    try_parse_tc_opts () {
+         if [[ ! -z $tc_opts ]]; then
+            parse_tc_opts "${tc_opts[@]}" 
+            tc_opts=()
+         fi
+         return 0
+    }
+
+    for ((;i<${#args[@]};i++)); do
+        arg=${args[$i]}
+
+        [[ -z "$arg" ]] && break
+
+        if [[ $arg =~ ^(bash|exec)$ ]]; then
+            try_parse_tc_opts
+            shift $i
+            handle_exec_or_bash "$@"
+            return $?
+        fi
+
+        # Get netem arg 
+        if [[ $arg =~ ^[io]?(delay|loss|duplicate|reorder)$ ]]; then
+            IFSTAT_RESET=1
+            try_parse_tc_opts
+            tc_opts+=($arg)
+            continue
+        fi
+
+        # Get port forward arg
+        if [[ $arg =~ ^[0-9]+/(udp|tcp)$ ]]; then
+            IFSTAT_RESET=1
+            try_parse_tc_opts
+            parse_port_forward "$arg"
+            continue
+        fi
+
+        # Get rate limit arg 
+        if [[ $arg =~ ^[io]?rate$ ]]; then
+            IFSTAT_RESET=1
+            try_parse_tc_opts
+            ((i++))
+            parse_rate_opts $arg ${args[$i]}
+            continue
+        fi
+
+        if [[ ! -z $tc_opts ]]; then
+            tc_opts+=($arg)
+        else
+            error "unknown argument: $arg"
+        fi
+    done
+
+    try_parse_tc_opts
+    reset_if_io_stat
+}
+
+if [[ $EUID -ne 0 ]]; then
+    error "You must be root to run this script"
+fi
+
+check_firewall_type
+
+CMD=$1
+
+if [[ $CMD =~ ^[v|verbose]$ ]]; then
+    VERBOSE=1
+    shift
+    CMD=$1
+fi
+
+if [[ -z $CMD ]]; then
+    help
+fi
+
+case $CMD in 
+    get)
+        shift
+        get_opt "$@"
+        ;;
+    u|up) 
+        msg "Create network namespace '$NS', $FW_MODE mode"
+        setup_interface && setup_firewall # Abort inside
+        echo "$NS"
+        ;;
+    d|down) 
+        msg "Cleanup network namespace '$NS'"
+        CLEANUP=0
+        cleanup_firewall && ((CLEANUP++))
+        cleanup_interface && ((CLEANUP++))
+        [[ $CLEANUP -eq 0 ]] && error "Firewall rule or interface '$VETH' not exists"
+        echo "OK"
+        ;;
+    *)
+        handle_cmd_args "$@"
+        ;;
+esac
