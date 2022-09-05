@@ -531,13 +531,16 @@ if [[ $CMD =~ ^[v|verbose]$ ]]; then
 fi
 
 if [[ -z $CMD ]]; then
-    help
+    help; exit 255;
 fi
 
 case $CMD in 
     get)
         shift
         get_opt "$@"
+        ;;
+    h|help)
+        help
         ;;
     u|up) 
         msg "Create network namespace '$NS', $FW_MODE mode"
