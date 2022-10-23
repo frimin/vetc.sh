@@ -53,12 +53,29 @@ VETC (Virtual Ethernet Traffic Control) 是一个配置虚拟以太网接口以�
                         [i|o]duplicate PERCENT [CORRELATION] |
                         [i|o]reorder PERCENT [CORRELATION] |
                         [i|o]rate RATE }
+### GETOPT
+
+输出当前配置值:
+
+    $ vetc get veth
 
 ### VERBOSE
 
 提供 v|verbose 选项进行完整的日志输出:
 
     $ vetc v up
+
+### NETCONFIG
+
+网络配置有两种: 一种为流量控制 (TRAFFIC_CONTROL)，一种为端口转发(PORT_FORWARD)。
+
+### PORT_FORWARD
+
+端口转发可以将外部指定端口流量NAT到虚拟以太网环境中:
+
+    $ vetc 8000/tcp 8001/udp
+
+**注意**: 只要重设了任何的流量控制和端口规则，会清除之前的所有规则。
 
 ### TRAFFIC_CONTROL
 
@@ -95,7 +112,7 @@ delay 延迟 loss 丢包 duplicate 重复 reorder 乱序 rate 速率限制中，
 
 临时的启用方法：
 
-    echo 1 > /proc/sys/net/ipv4/ip_forward
+    sysctl -w net.ipv4.ip_forward=1
 
 ## 多个实例支持
 
@@ -123,6 +140,7 @@ delay 延迟 loss 丢包 duplicate 重复 reorder 乱序 rate 速率限制中，
 - CentOS 7 
 - RHEL 9 (Red Hat Enterprise Linux 9), 
 需要 kernel-modules-extra 软件包，并启用 sch_netem 内核模块。见: [The Linux kernel RPM package overview](https://access.redhat.com/documentation/en-us/red_hat_enterprise_linux/9/html/managing_monitoring_and_updating_the_kernel/the-linux-kernel-rpm_managing-monitoring-and-updating-the-kernel#the-linux-kernel-rpm-package-overview_the-linux-kernel-rpm)
+- Debian 11
 
 ## Licence
 

@@ -129,13 +129,13 @@ te () {
 }
 
 is_nft () {
-    [[ -z "$(which iptables)" ]] && return 0 # Use nfttables
+    [[ -z "$(which iptables)" ]] && return 0 # Use nftables
     [[ -z "$(which nft)" ]] && return 1 # Use iptables
     # Any iptables rule-defining
-    [[ -z "$(iptables-save)" ]] && return 0 # Use nfttables
+    [[ -z "$(iptables-save)" ]] && return 0 # Use nftables
     # Any nft rule-defining
     [[ -z "$(nft list tables)" && -z "$(nft list ruleset)" ]] && return 1 # Use iptables
-    error "check nft failed"
+    return 0 # Default use nftables, debain11 work on it
 }
 
 check_firewall_type () {
@@ -146,6 +146,10 @@ check_firewall_type () {
         return 0
     fi
 
+    if [[ -z "$(which iptables)" ]] && [[ -z "$(which nft)" ]]; then
+        error "No firewall installed"
+    fi
+
     if is_nft; then
         FW_MODE='nftables'
         return 0
@@ -153,8 +157,6 @@ check_firewall_type () {
         FW_MODE='iptables'
         return 0
     fi
-
-    error "No firewall installed"
 }
 
 netns_exists () {
@@ -256,6 +258,13 @@ setup_forward () {
     return 0
 }
 
+check_sysctl() {
+    curval="$(sysctl -n "$1")"
+    if [[ "$curval" -ne $2 ]]; then
+        echo -e "$COLOR_YELLOW[Warning]$NC Require kernel parameters: $1=$2 (current value: $curval)" >&2
+    fi
+}
+
 setup_firewall () {
     if [[ $FW_MODE == 'firewalld' ]]; then
         if ! firewall-cmd --query-masquerade > /dev/null 2>/dev/null; then
@@ -280,9 +289,11 @@ setup_firewall () {
         pe nft "add rule ip $NAME nat_PREROUTING counter jump nat_PREROUTING_forward"
     fi
 
-    if [[ $(< /proc/sys/net/ipv4/ip_forward) -ne 1 ]]; then
-        echo -e "$COLOR_YELLOW[Warning]$NC Require IPv4 forward, try command: echo 1 > /proc/sys/net/ipv4/ip_forward" >&2
-    fi
+    default_route_ifname=$(/sbin/ip route | awk '/default/ { print $5 }' | head -n 1)
+
+    check_sysctl "net.ipv4.ip_forward" 1
+    check_sysctl "net.ipv4.conf.${default_route_ifname}.forwarding" 1
+    check_sysctl "net.ipv4.conf.${VETH}.forwarding" 1
 }
 
 cleanup_firewall() {
@@ -327,9 +338,10 @@ setup_tc() {
         ((QDISC_ID++))
     }
     
-    if [[ $(lsmod | grep sch_netem | wc -l) -eq 0 ]]; then
-        echo -e "$COLOR_YELLOW[Warning]$NC Require NETEM kernel module, try add command: modprobe sch_netem" >&2
-    fi
+    # OS auto load/unload module most time, excpet RHEL
+    #if [[ $(lsmod | grep sch_netem | wc -l) -eq 0 ]]; then
+    #    echo -e "$COLOR_YELLOW[Warning]$NC Require NETEM kernel module, try add command: modprobe sch_netem" >&2
+    #fi
 
     te tc qdisc del dev $VETH root
     te ip netns exec $NS tc qdisc del dev $VPEER root

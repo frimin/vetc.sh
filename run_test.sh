@@ -24,6 +24,10 @@ get_tests () {
     done < ./testcases/tests.txt
 }
 
+if [[ $EUID -ne 0 ]]; then
+    error "You must be root to run this script"
+fi
+
 for FILE in $(get_tests "$@"); do
     echo -e "${COLOR_GREEN}TEST: ${FILE}${NC}"
     $SHELL "$FILE"
