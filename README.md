@@ -6,6 +6,10 @@ VETC (Virtual Ethernet Traffic Control) 是一个配置虚拟以太网接口以�
 
 仅支持 IPv4
 
+虚拟以太网设备和网络命名空间示意图：
+
+![](img/vetc.png)
+
 ## 基本用法
 
 直接进入 bash 交互模式:
