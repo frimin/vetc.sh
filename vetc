@@ -546,8 +546,6 @@ if [[ -z $CMD ]]; then
     help; exit 255;
 fi
 
-echo "--"$CMD
-
 case $CMD in 
     get)
         shift
@@ -570,7 +568,6 @@ case $CMD in
         echo "OK"
         ;;
     s|session)
-        shift
         echo "Single session to network namespace '$NS', $FW_MODE mode"
         # try cleanup old rule
         CLEANUP=0
