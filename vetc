@@ -584,6 +584,7 @@ case $CMD in
 
         setup_interface && setup_firewall # Abort inside
         echo "network namespace '$NS' created"
+        shift
         handle_cmd_args "$@"
         ;;
     *)
