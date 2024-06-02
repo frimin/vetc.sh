@@ -536,7 +536,7 @@ check_firewall_type
 
 CMD=$1
 
-if [[ $CMD =~ ^[v|verbose]$ ]]; then
+if [[ $CMD =~ ^(v|verbose)$ ]]; then
     VERBOSE=1
     shift
     CMD=$1
@@ -545,6 +545,8 @@ fi
 if [[ -z $CMD ]]; then
     help; exit 255;
 fi
+
+echo "--"$CMD
 
 case $CMD in 
     get)
@@ -566,6 +568,26 @@ case $CMD in
         cleanup_interface && ((CLEANUP++))
         [[ $CLEANUP -eq 0 ]] && error "Firewall rule or interface '$VETH' not exists"
         echo "OK"
+        ;;
+    s|session)
+        shift
+        echo "Single session to network namespace '$NS', $FW_MODE mode"
+        # try cleanup old rule
+        CLEANUP=0
+        cleanup_firewall && ((CLEANUP++))
+        cleanup_interface && ((CLEANUP++))
+
+        if [[ $CLEANUP -eq 0 ]]; then
+            echo "Firewall rule or interface '$VETH' not exists"
+        else
+            echo "Firewall rule or interface '$VETH' cleaned"
+        fi
+
+        sleep 1
+
+        setup_interface && setup_firewall # Abort inside
+        echo "network namespace '$NS' created"
+        handle_cmd_args "$@"
         ;;
     *)
         handle_cmd_args "$@"
